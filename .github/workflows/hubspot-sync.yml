@@ -1,0 +1,32 @@
+name: HubSpot Data Pipeline
+
+on:
+  schedule:
+    # Runs automatically at 8:00, 10:00, and 12:00 UTC every day
+    - cron: '0 8,10,12 * * *'
+  workflow_dispatch: # Allows you to run it manually
+
+jobs:
+  sync_hubspot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20' 
+
+      - name: Install Packages
+        # REMOVED "cd Workers" because we are already in the right place!
+        run: npm install dotenv @supabase/supabase-js
+
+      - name: Run Pipeline
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          HUBSPOT_OBJECT_TYPE_ID: "2-35904844"
+        # CHANGED to just "node hubspot-sync.js"
+        run: node hubspot-sync.js
