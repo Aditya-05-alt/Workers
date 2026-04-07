@@ -1,4 +1,3 @@
-// Workers/hubspot-sync.js
 const path = require("path");
 require("dotenv").config({ path: path.resolve(__dirname, ".env") });
 const { createClient } = require("@supabase/supabase-js");
@@ -145,34 +144,90 @@ function transform(record) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// BULLETPROOF RETRY: Handles 502 Bad Gateway and other DB errors
+async function safeSupabaseUpsert(supabase, chunk, maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const { error } = await supabase
+        .from("vimeo_subscriptions_new")
+        .upsert(chunk, { onConflict: "record_id" });
+      
+      if (error) throw new Error(error.message);
+      return; // Success!
+
+    } catch (err) {
+      if (attempt === maxRetries) {
+        throw new Error(`Supabase Upsert failed after ${maxRetries} attempts. Last error: ${err.message}`);
+      }
+      const delay = attempt * 3000; // Waits 3s, then 6s, then 9s...
+      console.warn(`   ⚠️ Supabase hiccup (Attempt ${attempt}/${maxRetries}). Retrying in ${delay/1000}s...`);
+      await sleep(delay);
+    }
+  }
+}
+
+// BULLETPROOF RETRY: Handles HubSpot network drops
+async function safeHubspotFetch(body, maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(`https://api.hubapi.com/crm/v3/objects/${HUBSPOT_OBJECT_TYPE_ID}/search`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (res.status === 429) {
+        console.warn(`   ⚠️ HubSpot Rate limit hit. Sleeping 5 seconds...`);
+        await sleep(5000);
+        continue; // Try again without counting as a major failure
+      }
+
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
+      return await res.json();
+
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+      const delay = attempt * 3000;
+      console.warn(`   ⚠️ HubSpot hiccup (Attempt ${attempt}/${maxRetries}). Retrying in ${delay/1000}s...`);
+      await sleep(delay);
+    }
+  }
+}
+
 async function runSync() {
-  console.log(`\n🚀 Starting Uncapped Data Sync at ${new Date().toISOString()}`);
+  console.log(`\n🚀 Starting Bulletproof Data Sync at ${new Date().toISOString()}`);
 
   if (!HUBSPOT_TOKEN || HUBSPOT_TOKEN.length < 10) {
     console.error("❌ Fatal Error: HUBSPOT_TOKEN is missing or too short.");
     process.exit(1);
   }
+  console.log(`✅ [1/5] Keys loaded. Token: ${HUBSPOT_TOKEN.substring(0, 8)}...`);
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
 
   let endMs = Date.now();
-  let startMs = Date.now() - (5 * 24 * 60 * 60 * 1000); // 5 days back default
+  let startMs = Date.now() - (5 * 24 * 60 * 60 * 1000); // 5 days back
 
   try {
-    const { data: statusData } = await supabase
+    console.log(`⏳ [2/5] Connecting to Supabase to check memory...`);
+    
+    const { data: statusData, error: statusErr } = await supabase
       .from("sync_status")
       .select("last_sync_timestamp")
       .eq("id", "hubspot_daily")
       .single();
 
-    if (statusData?.last_sync_timestamp) {
-      startMs = parseInt(statusData.last_sync_timestamp, 10);
-      console.log(`🤖 Memory found. Starting from: ${new Date(startMs).toISOString()}`);
+    if (statusErr && statusErr.code !== 'PGRST116') {
+      console.log(`   ⚠️ Note: ${statusErr.message}`);
     }
 
-    // CHANGED: This is now a "let" so we can overwrite it when bypassing the limit
+    if (statusData?.last_sync_timestamp) {
+      startMs = parseInt(statusData.last_sync_timestamp, 10);
+      console.log(`   🤖 Memory found. Starting from: ${new Date(startMs).toISOString()}`);
+    }
+
     let filterGroups = [{
       filters: [
         { propertyName: "hs_lastmodifieddate", operator: "GTE", value: String(startMs) },
@@ -183,44 +238,30 @@ async function runSync() {
     let hasMore = true;
     let totalFetched = 0;
     let totalUpserted = 0;
-    let currentSearchFetched = 0; // Tracks fetches for the 10k limit
+    let currentSearchFetched = 0; 
     let hubspotCursor = undefined; 
     let latestTimestamp = startMs;
+    let page = 1;
+
+    console.log(`🌐 [3/5] Requesting data from HubSpot...`);
 
     while (hasMore) {
+      console.log(`   -> Fetching Page ${page}...`);
+      
       const body = {
         filterGroups: filterGroups,
         sorts: [{ propertyName: "hs_lastmodifieddate", direction: "ASCENDING" }],
         properties: PROPERTIES,
-        limit: 100, // HubSpot API max limit per page
+        limit: 100, 
       };
 
-      if (hubspotCursor) {
-        body.after = parseInt(hubspotCursor, 10);
-      }
+      if (hubspotCursor) body.after = parseInt(hubspotCursor, 10);
 
-      const res = await fetch(
-        `https://api.hubapi.com/crm/v3/objects/${HUBSPOT_OBJECT_TYPE_ID}/search`,
-        {
-          method: "POST",
-          headers: { 
-            "Authorization": `Bearer ${HUBSPOT_TOKEN}`, 
-            "Content-Type": "application/json" 
-          },
-          body: JSON.stringify(body),
-        }
-      );
-
-      if (res.status === 429) {
-        console.warn("⚠️ Rate limit hit. Sleeping 5 seconds...");
-        await sleep(5000);
-        continue;
-      }
-
-      if (!res.ok) throw new Error(`HubSpot Search API failed: ${res.status} ${await res.text()}`);
-
-      const data = await res.json();
+      // Using our new robust fetch
+      const data = await safeHubspotFetch(body);
       const results = Array.isArray(data?.results) ? data.results : [];
+      
+      console.log(`   -> ✅ Got ${results.length} records!`);
       
       totalFetched += results.length;
       currentSearchFetched += results.length;
@@ -229,22 +270,19 @@ async function runSync() {
 
       const transformedRows = results.map(transform);
 
-      // Upserting 500 at a time to Supabase Database
+      console.log(`💾 [4/5] Upserting to Supabase...`);
       const BATCH = 500; 
       for (let i = 0; i < transformedRows.length; i += BATCH) {
         const chunk = transformedRows.slice(i, i + BATCH);
-        const { error } = await supabase
-          .from("vimeo_subscriptions_new")
-          .upsert(chunk, { onConflict: "record_id" });
-          
-        if (error) throw new Error(`HubSpot upsert error: ${error.message}`);
         
+        // Using our new bulletproof upsert
+        await safeSupabaseUpsert(supabase, chunk);
+          
         totalUpserted += chunk.length;
-        console.log(`💾 Saved chunk. Total saved: ${totalUpserted}`);
+        console.log(`   -> Saved chunk. Total saved: ${totalUpserted}`);
         await sleep(300); 
       }
 
-      // Track the highest timestamp we've seen so far
       if (transformedRows.length > 0) {
         const lastRecordTime = new Date(transformedRows[transformedRows.length - 1].hs_lastmodifieddate).getTime();
         latestTimestamp = Math.max(latestTimestamp, lastRecordTime);
@@ -252,33 +290,24 @@ async function runSync() {
 
       hubspotCursor = data?.paging?.next?.after;
       
-      // ==========================================
-      // THE 10,000 LIMIT BYPASS (THE "TIME SLIDE")
-      // ==========================================
       if (currentSearchFetched >= 9500 && hubspotCursor) {
-        console.log(`\n🔄 Approaching HubSpot 10k Limit! Performing Time Slide to ${new Date(latestTimestamp).toISOString()}...`);
-        
-        // 1. Destroy the cursor so HubSpot doesn't crash
+        console.log(`\n🔄 Time Slide Activated! Bypassing HubSpot 10k limit...`);
         hubspotCursor = undefined; 
-        
-        // 2. Change the filter to start exactly where we left off
         filterGroups = [{
           filters: [
             { propertyName: "hs_lastmodifieddate", operator: "GTE", value: String(latestTimestamp) },
             { propertyName: "hs_lastmodifieddate", operator: "LTE", value: String(endMs) }
           ]
         }];
-        
-        // 3. Reset our local 10k counter, but keep the loop running
         currentSearchFetched = 0; 
         hasMore = true; 
-        
       } else {
         hasMore = !!hubspotCursor;
       }
+      page++;
     }
 
-    console.log(`\n🏁 Sync complete. Saving current timestamp to memory...`);
+    console.log(`\n🏁 [5/5] Sync complete. Saving memory...`);
     await supabase.from("sync_status").upsert({
       id: "hubspot_daily",
       last_sync_timestamp: endMs, 
