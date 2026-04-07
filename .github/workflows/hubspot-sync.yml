@@ -3,7 +3,7 @@ name: HubSpot Data Pipeline
 on:
   schedule:
     # Runs automatically at 8:00, 10:00, and 12:00 UTC every day
-    - cron: '0 8,10,12 * * *'
+    - cron: '0 8 * * *'
   workflow_dispatch: # Allows you to run it manually
 
 jobs:
